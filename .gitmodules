@@ -1,3 +1,0 @@
-[submodule "updater_cli/HDiffPatch"]
-	path = updater_cli/HDiffPatch
-	url = https://github.com/sisong/HDiffPatch

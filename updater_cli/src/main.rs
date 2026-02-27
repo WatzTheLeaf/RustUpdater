@@ -3,6 +3,9 @@ extern crate zstd; // To avoid compilator to strip it
 mod models;
 mod updater;
 
+pub mod patchers;
+pub mod utils;
+
 use anyhow::Result;
 use std::io::{self, Write};
 use std::time::Instant;
@@ -10,7 +13,7 @@ use updater::GameUpdater;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let server_url = "http://192.168.1.28:3000/";
+    let server_url = "http://127.0.0.1:3000/";
     let updater = GameUpdater::new(server_url);
 
     println!("--- Custom Game Updater Tester ---");

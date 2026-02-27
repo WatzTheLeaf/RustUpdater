@@ -2,21 +2,12 @@
 use anyhow::{Context, Result};
 use futures::stream::{self, StreamExt};
 use reqwest::Client;
-use std::ffi::CString;
 use std::fs;
-use std::os::raw::{c_char, c_int};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-unsafe extern "C" {
-    fn hpatch_patch_file(
-        old_path: *const c_char,
-        patch_path: *const c_char,
-        out_path: *const c_char,
-    ) -> c_int;
-}
+use crate::patchers::HDiff;
 
 /// Files larger than this are written to disk via streaming instead of being
 /// loaded entirely into RAM first.
@@ -238,21 +229,43 @@ async fn apply_patch(
     out_path: PathBuf,
 ) -> Result<(i32, Duration)> {
     tokio::task::spawn_blocking(move || {
-        let c_old =
-            CString::new(old_path.to_str().unwrap_or_default()).context("Invalid old path")?;
-        let c_patch = CString::new(patch_path.to_str().unwrap_or_default())
-            .context("Invalid patch path")?;
-        let c_out =
-            CString::new(out_path.to_str().unwrap_or_default()).context("Invalid output path")?;
-
         let t0 = Instant::now();
-        let ret =
-            unsafe { hpatch_patch_file(c_old.as_ptr(), c_patch.as_ptr(), c_out.as_ptr()) };
+
+        // Safe in-place patching: write to a .tmp file if paths match
+        let is_in_place = old_path == out_path;
+        let actual_out_path = if is_in_place {
+            out_path.with_extension("tmp_patch")
+        } else {
+            out_path.clone()
+        };
+
+        // Convert PathBuf to String for HDiff::new
+        let old_str = old_path.to_string_lossy().to_string();
+        let patch_str = patch_path.to_string_lossy().to_string();
+        let out_str = actual_out_path.to_string_lossy().to_string();
+
+        // Initialize and run the Rust patcher
+        let mut patcher = HDiff::new(old_str, patch_str, out_str);
+        let success = patcher.apply();
+
+        // Handle successful in-place temp file renaming
+        if success && is_in_place {
+            if let Err(e) = std::fs::rename(&actual_out_path, &out_path) {
+                eprintln!("[apply_patch] Failed to rename temp file over original: {}", e);
+                return Ok((1, t0.elapsed())); // 1 = failure
+            }
+        } else if !success && is_in_place {
+            // Clean up the temp file if the patch failed
+            let _ = std::fs::remove_file(&actual_out_path);
+        }
+
+        // Map boolean success to the i32 return code (0 = success, 1 = error)
+        let ret = if success { 0 } else { 1 };
 
         Ok((ret, t0.elapsed()))
     })
-    .await
-    .context("Patch task panicked")?
+        .await
+        .context("Patch task panicked")?
 }
 
 /// Download a URL and write it to `dest`.

@@ -41,7 +41,6 @@ pub fn generate_patch(old_file: &Path, new_file: &Path, out_file: &Path) -> Resu
         .arg(old_file)
         .arg(new_file)
         .arg(out_file)
-        .arg("-SD")
         .arg("-c-zstd-21")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
