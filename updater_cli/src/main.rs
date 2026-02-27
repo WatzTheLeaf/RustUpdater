@@ -62,24 +62,18 @@ async fn main() -> Result<()> {
     let (product_name, entry) = products_list[choice - 1];
     let local_ver = ProductUpdater::get_local_version(product_name);
 
-    // Determine the version to install/update to.
     let mut target_version = entry.latest_version.clone();
+    let mut needs_update = false;
 
-    let should_proceed = if local_ver.is_none() {
+    if local_ver.is_none() {
         println!("\n{} is not installed.", product_name);
-
-        // Let the user pick a specific version for a fresh install.
         if !entry.versions.is_empty() {
             println!("Available versions for a fresh install:");
             for (i, v) in entry.versions.iter().enumerate() {
                 println!("  {}. {}", i + 1, v);
             }
-            print!(
-                "Select a version number (or press Enter for latest [{}]): ",
-                entry.latest_version
-            );
+            print!("Select a version number (or press Enter for latest [{}]): ", entry.latest_version);
             io::stdout().flush()?;
-
             let mut v_input = String::new();
             io::stdin().read_line(&mut v_input)?;
             let v_choice: usize = v_input.trim().parse().unwrap_or(0);
@@ -87,50 +81,62 @@ async fn main() -> Result<()> {
                 target_version = entry.versions[v_choice - 1].clone();
             }
         }
-
         print!("Proceed to install version {}? (y/n): ", target_version);
-        true
+        needs_update = true;
     } else if local_ver.as_ref() != Some(&entry.latest_version) {
-        let current = local_ver.unwrap();
-        print!(
-            "{} update available! ({} -> {}). Update now? (y/n): ",
-            product_name, current, entry.latest_version
-        );
-        target_version = entry.latest_version.clone();
-        true
+        println!("{} update available! ({} -> {})", product_name, local_ver.as_ref().unwrap(), entry.latest_version);
+        print!("Update now? (y/n): ");
+        needs_update = true;
     } else {
-        println!(
-            "{} is already up to date (Version {}).",
-            product_name, entry.latest_version
-        );
-        return Ok(());
-    };
+        println!("{} is already up to date (Version {}).", product_name, entry.latest_version);
+        print!("Would you like to verify file integrity? (y/n): ");
+        needs_update = false; // We use the same 'y' logic to trigger verification
+    }
 
-    if should_proceed {
-        io::stdout().flush()?;
-        let mut confirm = String::new();
-        io::stdin().read_line(&mut confirm)?;
+    io::stdout().flush()?;
+    let mut confirm = String::new();
+    io::stdin().read_line(&mut confirm)?;
 
-        if confirm.trim().to_lowercase() == "y" {
-            println!("\nStarting process for {} v{}...", product_name, target_version);
-
+    if confirm.trim().to_lowercase() == "y" {
+        if needs_update {
+            println!("\nStarting update process for {} v{}...", product_name, target_version);
             let wall_start = Instant::now();
 
-            match updater.perform_update(product_name, &target_version).await {
-                Ok(stats) => {
-                    let wall_time = wall_start.elapsed();
-                    println!("\nInstallation/Update finished successfully!");
-                    stats.print_summary();
-                    println!("  Total wall-clock time : {:.2?}", wall_time);
-                    println!("========================================");
+            match updater.perform_update(product_name, &target_version, &entry.versions).await {
+                Ok(_) => {
+                    println!("\nUpdate finished successfully in {:.2?}.", wall_start.elapsed());
                 }
                 Err(e) => {
                     eprintln!("Update failed: {}", e);
+                    return Ok(());
                 }
             }
-        } else {
-            println!("Operation cancelled.");
         }
+
+        // Integrity check
+        println!("\nRunning integrity check...");
+        let check_start = Instant::now();
+        // Use the target version (the one we just installed) or the local version
+        let version_to_check = ProductUpdater::get_local_version(product_name).unwrap_or(target_version);
+
+        match updater.verify_integrity(product_name, &version_to_check).await {
+            Ok(corrupted) => {
+                if corrupted.is_empty() {
+                    println!("Integrity check passed! All files are 100% correct.");
+                } else {
+                    println!("CRITICAL: Found {} corrupted or missing files:", corrupted.len());
+                    for file in corrupted {
+                        println!("  [!] {}", file);
+                    }
+                    println!("Suggestion: Run the update again to repair these files.");
+                }
+            }
+            Err(e) => eprintln!("Integrity check failed to run: {}", e),
+        }
+        println!("Integrity check took: {:.2?}", check_start.elapsed());
+
+    } else {
+        println!("Operation cancelled.");
     }
 
     Ok(())

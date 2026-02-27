@@ -1,13 +1,11 @@
 ﻿use crate::models::{FileEntry, Manifest, RootJson};
+use crate::patchers::HDiff;
 use anyhow::{Context, Result};
 use futures::stream::{self, StreamExt};
 use reqwest::Client;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use crate::patchers::HDiff;
 
 /// Files larger than this are written to disk via streaming instead of being
 /// loaded entirely into RAM first.
@@ -15,83 +13,6 @@ const STREAM_THRESHOLD: u64 = 30 * 1024 * 1024; // 30 MB
 
 /// Maximum number of concurrent file operations.
 const CONCURRENCY: usize = 8;
-
-// ---------------------------------------------------------------------------
-// Benchmark statistics
-// ---------------------------------------------------------------------------
-
-/// Counters collected during an update run.
-#[derive(Debug, Default)]
-pub struct UpdateStats {
-    /// Files that were already up to date (skipped).
-    pub skipped: u64,
-    /// Files updated via binary patch.
-    pub patched: u64,
-    /// Files downloaded in full.
-    pub full_downloads: u64,
-    /// Total bytes of patch files downloaded.
-    pub patch_bytes: u64,
-    /// Total bytes of full files downloaded.
-    pub full_bytes: u64,
-    /// Files whose full download was streamed (>= STREAM_THRESHOLD).
-    pub streamed: u64,
-    /// Total wall-clock time spent applying patches (across all threads).
-    pub patch_time: Duration,
-}
-
-impl UpdateStats {
-    /// Total number of files processed.
-    pub fn total_files(&self) -> u64 {
-        self.skipped + self.patched + self.full_downloads
-    }
-
-    pub fn print_summary(&self) {
-        println!("========================================");
-        println!("  UPDATE BENCHMARK SUMMARY");
-        println!("========================================");
-        println!("  Total files processed : {}", self.total_files());
-        println!("  Already up to date    : {}", self.skipped);
-        println!("  Applied patches       : {}", self.patched);
-        println!("  Full downloads        : {}", self.full_downloads);
-        println!(
-            "  Patch data downloaded : {}",
-            human_bytes(self.patch_bytes)
-        );
-        println!(
-            "  Full data downloaded  : {}",
-            human_bytes(self.full_bytes)
-        );
-        println!("  Streamed (large) files: {}", self.streamed);
-        println!("  Total patch CPU time  : {:.2?}", self.patch_time);
-        println!("========================================");
-    }
-}
-
-/// Shared atomic accumulators used across concurrent tasks.
-#[derive(Debug, Default)]
-struct AtomicStats {
-    skipped: AtomicU64,
-    patched: AtomicU64,
-    full_downloads: AtomicU64,
-    patch_bytes: AtomicU64,
-    full_bytes: AtomicU64,
-    streamed: AtomicU64,
-    patch_nanos: AtomicU64,
-}
-
-impl AtomicStats {
-    fn snapshot(&self) -> UpdateStats {
-        UpdateStats {
-            skipped: self.skipped.load(Ordering::Relaxed),
-            patched: self.patched.load(Ordering::Relaxed),
-            full_downloads: self.full_downloads.load(Ordering::Relaxed),
-            patch_bytes: self.patch_bytes.load(Ordering::Relaxed),
-            full_bytes: self.full_bytes.load(Ordering::Relaxed),
-            streamed: self.streamed.load(Ordering::Relaxed),
-            patch_time: Duration::from_nanos(self.patch_nanos.load(Ordering::Relaxed)),
-        }
-    }
-}
 
 pub struct ProductUpdater {
     base_url: String,
@@ -127,69 +48,42 @@ impl ProductUpdater {
         json["version"].as_str().map(str::to_string)
     }
 
-    /// Download and apply all file changes for `product_name` to reach `target_version`.
-    /// Returns benchmark statistics for the completed run.
+    /// Initiates an update to a specific target version.
+    /// It calculates the optimal sequential patch path based on the root.json versions array.
     pub async fn perform_update(
         &self,
         product_name: &str,
         target_version: &str,
-    ) -> Result<UpdateStats> {
-        let manifest = self.fetch_manifest(product_name, target_version).await?;
+        available_versions: &[String],
+    ) -> Result<()> {
+        let current_version = Self::get_local_version(product_name).unwrap_or_else(|| "0.0.0".to_string());
 
-        let product_dir = PathBuf::from("products").join(product_name);
-        fs::create_dir_all(&product_dir).context("Failed to create product directory")?;
-        fs::create_dir_all("temp").context("Failed to create temp directory")?;
-
-        let stats = Arc::new(AtomicStats::default());
-
-        // Process all files concurrently, up to CONCURRENCY at a time.
-        // Each file gets its own async task; patching runs on a dedicated
-        // blocking thread via spawn_blocking so it never stalls the executor.
-        let results = stream::iter(manifest.files)
-            .map(|(rel_path, file_entry)| {
-                let client = self.client.clone();
-                let base_url = self.base_url.clone();
-                let product_name = product_name.to_string();
-                let version = manifest.version.clone();
-                let product_dir = product_dir.clone();
-                let stats = Arc::clone(&stats);
-
-                async move {
-                    update_file(
-                        &client,
-                        &base_url,
-                        &product_name,
-                        &version,
-                        &product_dir,
-                        &rel_path,
-                        &file_entry,
-                        &stats,
-                    )
-                    .await
-                }
-            })
-            .buffer_unordered(CONCURRENCY)
-            .collect::<Vec<_>>()
-            .await;
-
-        // Propagate the first error encountered, if any.
-        for result in results {
-            result?;
+        if current_version == target_version {
+            return Ok(()); // Already up to date
         }
 
-        // Persist the new version marker.
-        let version_json =
-            serde_json::to_string_pretty(&serde_json::json!({ "version": manifest.version }))?;
-        fs::write(product_dir.join("version.json"), version_json)
-            .context("Failed to write version.json")?;
+        // Calculate the update path
+        let mut update_path = Vec::new();
 
-        let _ = fs::remove_dir_all("temp");
+        if let Some(current_idx) = available_versions.iter().position(|v| v == &current_version) {
+            if let Some(target_idx) = available_versions.iter().position(|v| v == target_version) {
+                if current_idx < target_idx {
+                    // Get all versions AFTER current up to the target
+                    update_path = available_versions[current_idx + 1..=target_idx].to_vec();
+                }
+            }
+        }
 
-        Ok(Arc::try_unwrap(stats)
-            .expect("stats Arc still has other owners")
-            .snapshot())
+        // If sequential path calculation failed (e.g., fresh install or downgrade),
+        // just target the final version directly for a full download.
+        if update_path.is_empty() {
+            update_path = vec![target_version.to_string()];
+        }
+
+        self.perform_update_path(product_name, &update_path).await
     }
 
+    /// Fetch a specific version's manifest for a product.
     async fn fetch_manifest(&self, product_name: &str, version: &str) -> Result<Manifest> {
         let url = format!(
             "{}products/{}/{}/manifest.json",
@@ -204,6 +98,168 @@ impl ProductUpdater {
             .await
             .context("Failed to parse manifest.json")
     }
+
+    /// Internal method that executes the determined update path
+    async fn perform_update_path(
+        &self,
+        product_name: &str,
+        update_path: &[String],
+    ) -> Result<()> {
+        let target_version = update_path.last().unwrap();
+        let target_manifest = self.fetch_manifest(product_name, target_version).await?;
+
+        let product_dir = PathBuf::from("products").join(product_name);
+        fs::create_dir_all(&product_dir).context("Failed to create product directory")?;
+        fs::create_dir_all("temp").context("Failed to create temp directory")?;
+
+        // Fetch all manifests in the update path
+        let mut manifests = Vec::new();
+        for ver in update_path {
+            if ver == target_version {
+                manifests.push(target_manifest.clone());
+            } else {
+                manifests.push(self.fetch_manifest(product_name, ver).await?);
+            }
+        }
+
+        // Calculate the size of a complete full download of the target version
+        let full_size: u64 = target_manifest.files.values().map(|e| e.size).sum();
+
+        // Calculate the cumulative cost of intermediate patches using the new struct field
+        let total_patch_cost: u64 = manifests.iter().map(|m| m.total_patch_size).sum();
+
+        // Evaluate strategy
+        // We only patch if the total patch cost is strictly less than a full download.
+        // Also if total_patch_cost is 0, it means no patches exist, so we force a full download.
+        if total_patch_cost > 0 && total_patch_cost < full_size {
+            println!(
+                "-> Patch cost ({} bytes) is cheaper than full download ({} bytes). Applying sequentially...",
+                total_patch_cost, full_size
+            );
+
+            for manifest in manifests {
+                println!("-> Applying update for version {}...", manifest.version);
+                self.apply_manifest(product_name, &manifest, &product_dir, true).await?;
+
+                // Save intermediate version progression in case of unexpected closure
+                Self::save_local_version(&product_dir, &manifest.version)?;
+            }
+        } else {
+            println!(
+                "-> Patch cost ({} bytes) exceeds full download ({} bytes) or patches are missing. Forcing full download...",
+                total_patch_cost, full_size
+            );
+
+            // Apply the final manifest directly with patching disabled to force a fresh download
+            self.apply_manifest(product_name, &target_manifest, &product_dir, false).await?;
+            Self::save_local_version(&product_dir, target_version)?;
+        }
+
+        let _ = fs::remove_dir_all("temp");
+        Ok(())
+    }
+
+    /// Process a single manifest concurrently
+    async fn apply_manifest(
+        &self,
+        product_name: &str,
+        manifest: &Manifest,
+        product_dir: &Path,
+        allow_patch: bool,
+    ) -> Result<()> {
+        // Handle file deletions first if the manifest specifies them
+        for deleted_file in &manifest.deleted_files {
+            let file_path = product_dir.join(deleted_file);
+            if file_path.exists() {
+                let _ = fs::remove_file(file_path);
+            }
+        }
+
+        let results = stream::iter(&manifest.files)
+            .map(|(rel_path, file_entry)| {
+                let client = self.client.clone();
+                let base_url = self.base_url.clone();
+                let product_name = product_name.to_string();
+                let version = manifest.version.clone();
+                let product_dir = product_dir.to_path_buf();
+
+                let rel_path = rel_path.clone();
+                let file_entry = file_entry.clone();
+
+                async move {
+                    update_file(
+                        &client,
+                        &base_url,
+                        &product_name,
+                        &version,
+                        &product_dir,
+                        &rel_path,
+                        &file_entry,
+                        allow_patch,
+                    )
+                        .await
+                }
+            })
+            .buffer_unordered(CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+
+        for result in results {
+            result?; // Propagate the first error encountered, if any
+        }
+
+        Ok(())
+    }
+
+    fn save_local_version(product_dir: &Path, version: &str) -> Result<()> {
+        let version_json = serde_json::to_string_pretty(&serde_json::json!({ "version": version }))?;
+        fs::write(product_dir.join("version.json"), version_json)
+            .context("Failed to write version.json")?;
+        Ok(())
+    }
+
+    /// Verify the integrity of a locally installed product against it's manifest
+    pub async fn verify_integrity(&self, product_name: &str, version: &str) -> Result<Vec<String>> {
+        println!("Fetching manifest to verify {} v{}...", product_name, version);
+        let manifest = self.fetch_manifest(product_name, version).await?;
+        let product_dir = PathBuf::from("products").join(product_name);
+
+        if !product_dir.exists() {
+            return Err(anyhow::anyhow!("Product directory does not exist."));
+        }
+
+        println!("Verifying {} files. This may take a moment...", manifest.files.len());
+
+        // Process file hashing concurrently
+        let corrupted_files: Vec<String> = stream::iter(manifest.files)
+            .map(|(rel_path, entry)| {
+                let path = product_dir.join(&rel_path);
+                let expected_hash = entry.hash.clone();
+                let rel_path_clone = rel_path.clone();
+
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        if !path.exists() {
+                            return Some(rel_path_clone);
+                        }
+
+                        // Hash the file and compare
+                        match file_hash(&path) {
+                            Ok(hash) if hash == expected_hash => None,
+                            _ => Some(rel_path_clone),
+                        }
+                    })
+                        .await
+                        .expect("Blocking task panicked")
+                }
+            })
+            .buffer_unordered(CONCURRENCY)
+            .filter_map(|result| async { result })
+            .collect()
+            .await;
+
+        Ok(corrupted_files)
+    }
 }
 
 /// Compute the BLAKE3 hash of a file on disk.
@@ -215,14 +271,7 @@ fn file_hash(path: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-/// Apply an HDiffPatch binary patch using the compiled C library.
-///
-/// Supports in-place patching (old_path == out_path): the C wrapper writes
-/// to a temp file and renames it over the original.
-///
-/// Each call spawns its own blocking OS thread via `spawn_blocking`, so
-/// multiple patches run truly in parallel without blocking the async executor.
-/// Returns `(return_code, elapsed)`.
+/// Apply an HDiffPatch binary patch using the native Rust library.
 async fn apply_patch(
     old_path: PathBuf,
     patch_path: PathBuf,
@@ -231,37 +280,34 @@ async fn apply_patch(
     tokio::task::spawn_blocking(move || {
         let t0 = Instant::now();
 
-        // Safe in-place patching: write to a .tmp file if paths match
         let is_in_place = old_path == out_path;
         let actual_out_path = if is_in_place {
-            out_path.with_extension("tmp_patch")
+            // Append the tmp_patch, don't remove the existing file extension,
+            // can be an issue with multithreading and files with same name (but different extension)
+            let mut p = out_path.clone().into_os_string();
+            p.push(".tmp_patch");
+            PathBuf::from(p)
         } else {
             out_path.clone()
         };
 
-        // Convert PathBuf to String for HDiff::new
         let old_str = old_path.to_string_lossy().to_string();
         let patch_str = patch_path.to_string_lossy().to_string();
         let out_str = actual_out_path.to_string_lossy().to_string();
 
-        // Initialize and run the Rust patcher
         let mut patcher = HDiff::new(old_str, patch_str, out_str);
         let success = patcher.apply();
 
-        // Handle successful in-place temp file renaming
         if success && is_in_place {
             if let Err(e) = std::fs::rename(&actual_out_path, &out_path) {
                 eprintln!("[apply_patch] Failed to rename temp file over original: {}", e);
-                return Ok((1, t0.elapsed())); // 1 = failure
+                return Ok((1, t0.elapsed()));
             }
         } else if !success && is_in_place {
-            // Clean up the temp file if the patch failed
             let _ = std::fs::remove_file(&actual_out_path);
         }
 
-        // Map boolean success to the i32 return code (0 = success, 1 = error)
         let ret = if success { 0 } else { 1 };
-
         Ok((ret, t0.elapsed()))
     })
         .await
@@ -269,16 +315,12 @@ async fn apply_patch(
 }
 
 /// Download a URL and write it to `dest`.
-///
-/// `known_size` is the expected file size from the manifest (used to decide
-/// whether to buffer the response in RAM or stream it directly to disk).
-/// Returns the number of bytes written and whether streaming was used.
 async fn download_to(
     client: &Client,
     url: &str,
     dest: &Path,
     known_size: u64,
-) -> Result<(u64, bool)> {
+) -> Result<()> {
     let response = client
         .get(url)
         .send()
@@ -288,38 +330,26 @@ async fn download_to(
     let streamed = known_size >= STREAM_THRESHOLD;
 
     if !streamed {
-        // Small file: buffer entirely in RAM, then write atomically.
         let bytes = response
             .bytes()
             .await
             .with_context(|| format!("Failed to read response body from {}", url))?;
-        let len = bytes.len() as u64;
         fs::write(dest, bytes)
             .with_context(|| format!("Failed to write {}", dest.display()))?;
-        Ok((len, false))
     } else {
-        // Large file: stream directly to disk to avoid high memory usage.
         let mut file = fs::File::create(dest)
             .with_context(|| format!("Failed to create {}", dest.display()))?;
-        let mut total = 0u64;
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.with_context(|| format!("Stream error from {}", url))?;
-            total += chunk.len() as u64;
             std::io::Write::write_all(&mut file, &chunk)
                 .with_context(|| format!("Failed to write chunk to {}", dest.display()))?;
         }
-        Ok((total, true))
     }
+    Ok(())
 }
 
-/// Ensure a single product file is at the correct version and record stats.
-///
-/// Strategy (in order of preference):
-/// 1. **Skip** — file already matches the expected hash -> nothing to do.
-/// 2. **Binary patch** — a `.patch` file is available and the old file exists ->
-///    download the patch, apply it via the HDiffPatch C library, verify hash.
-/// 3. **Full download** — fallback when no patch is available or the patch fails.
+/// Ensure a single product file is at the correct version.
 #[allow(clippy::too_many_arguments)]
 async fn update_file(
     client: &Client,
@@ -329,11 +359,10 @@ async fn update_file(
     product_dir: &Path,
     rel_path: &str,
     entry: &FileEntry,
-    stats: &AtomicStats,
+    allow_patch: bool,
 ) -> Result<()> {
     let dest = product_dir.join(rel_path);
 
-    // Ensure parent directories exist
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create directory {}", parent.display()))?;
@@ -341,33 +370,29 @@ async fn update_file(
 
     // Already up to date?
     if dest.exists() && file_hash(&dest).unwrap_or_default() == entry.hash {
-        stats.skipped.fetch_add(1, Ordering::Relaxed);
         return Ok(());
     }
 
-    // Binary patch available and old file present?
-    if let (Some(patch_info), true) = (&entry.patch, dest.exists()) {
-        let patch_url = format!(
-            "{}products/{}/{}/{}",
-            base_url, product_name, version, patch_info.file
-        );
+    // Binary patch available and permitted by the active strategy?
+    if allow_patch {
+        if let (Some(patch_info), true) = (&entry.patch, dest.exists()) {
+            let patch_url = format!(
+                "{}products/{}/{}/{}",
+                base_url, product_name, version, patch_info.file
+            );
 
-        let safe_temp_name = rel_path.replace("/", "_").replace("\\", "_");
-        let patch_dest = PathBuf::from("temp").join(format!("{}.patch", safe_temp_name));
+            let safe_temp_name = rel_path.replace("/", "_").replace("\\", "_");
+            let patch_dest = PathBuf::from("temp").join(format!("{}.patch", safe_temp_name));
 
-        let (patch_bytes, _) = download_to(client, &patch_url, &patch_dest, 0).await?;
+            let _ = download_to(client, &patch_url, &patch_dest, 0).await?;
+            let (ret, _) = apply_patch(dest.clone(), patch_dest.clone(), dest.clone()).await?;
+            let _ = fs::remove_file(&patch_dest);
 
-        let (ret, elapsed) =
-            apply_patch(dest.clone(), patch_dest.clone(), dest.clone()).await?;
-        let _ = fs::remove_file(&patch_dest);
-
-        if ret == 0 && file_hash(&dest).unwrap_or_default() == entry.hash {
-            stats.patched.fetch_add(1, Ordering::Relaxed);
-            stats.patch_bytes.fetch_add(patch_bytes, Ordering::Relaxed);
-            stats
-                .patch_nanos
-                .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
-            return Ok(());
+            if ret == 0 && file_hash(&dest).unwrap_or_default() == entry.hash {
+                return Ok(());
+            } else {
+                eprintln!("Patch failed or hash mismatch for {}. Falling back to full download...", rel_path);
+            }
         }
     }
 
@@ -376,32 +401,7 @@ async fn update_file(
         "{}products/{}/{}/full/{}",
         base_url, product_name, version, rel_path
     );
-    let (full_bytes, streamed) = download_to(client, &full_url, &dest, entry.size).await?;
-
-    stats.full_downloads.fetch_add(1, Ordering::Relaxed);
-    stats.full_bytes.fetch_add(full_bytes, Ordering::Relaxed);
-    if streamed {
-        stats.streamed.fetch_add(1, Ordering::Relaxed);
-    }
+    download_to(client, &full_url, &dest, entry.size).await?;
 
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Formatting helpers
-// ---------------------------------------------------------------------------
-
-fn human_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-    if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.2} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.2} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} B", bytes)
-    }
 }

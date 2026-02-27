@@ -15,15 +15,19 @@ pub struct ProductEntry {
     pub versions: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Manifest {
     pub version: String,
+    #[serde(default)]
+    pub exe: String,
+    #[serde(default)]
+    pub total_patch_size: u64,
     pub files: HashMap<String, FileEntry>,
     #[serde(default)]
     pub deleted_files: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FileEntry {
     pub hash: String,
     pub size: u64,
@@ -31,7 +35,7 @@ pub struct FileEntry {
     pub patch: Option<PatchInfo>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PatchInfo {
     pub file: String,
 }
