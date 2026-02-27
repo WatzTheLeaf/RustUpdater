@@ -9,14 +9,14 @@ pub mod utils;
 use anyhow::Result;
 use std::io::{self, Write};
 use std::time::Instant;
-use updater::GameUpdater;
+use updater::ProductUpdater;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let server_url = "http://127.0.0.1:3000/";
-    let updater = GameUpdater::new(server_url);
+    let updater = ProductUpdater::new(server_url);
 
-    println!("--- Custom Game Updater Tester ---");
+    println!("--- Custom Updater Tester ---");
     println!("Fetching root.json from server...");
 
     let root = match updater.fetch_root().await {
@@ -27,18 +27,18 @@ async fn main() -> Result<()> {
         }
     };
 
-    if root.games.is_empty() {
-        println!("No games found on server.");
+    if root.products.is_empty() {
+        println!("No products found on server.");
         return Ok(());
     }
 
-    println!("\nAvailable Games:");
-    let mut games_list: Vec<(&String, &models::GameEntry)> = root.games.iter().collect();
-    games_list.sort_by_key(|k| k.0);
+    println!("\nAvailable Products:");
+    let mut products_list: Vec<(&String, &models::ProductEntry)> = root.products.iter().collect();
+    products_list.sort_by_key(|k| k.0);
 
-    for (i, (name, entry)) in games_list.iter().enumerate() {
+    for (i, (name, entry)) in products_list.iter().enumerate() {
         let local_ver =
-            GameUpdater::get_local_version(name).unwrap_or_else(|| "Not Installed".to_string());
+            ProductUpdater::get_local_version(name).unwrap_or_else(|| "Not Installed".to_string());
         println!(
             "{}. {} (Local: {} | Latest: {})",
             i + 1,
@@ -48,25 +48,25 @@ async fn main() -> Result<()> {
         );
     }
 
-    print!("\nEnter the number of the game to manage (or 0 to quit): ");
+    print!("\nEnter the number of the product to manage (or 0 to quit): ");
     io::stdout().flush()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
     let choice: usize = input.trim().parse().unwrap_or(0);
 
-    if choice == 0 || choice > games_list.len() {
+    if choice == 0 || choice > products_list.len() {
         println!("Exiting.");
         return Ok(());
     }
 
-    let (game_name, entry) = games_list[choice - 1];
-    let local_ver = GameUpdater::get_local_version(game_name);
+    let (product_name, entry) = products_list[choice - 1];
+    let local_ver = ProductUpdater::get_local_version(product_name);
 
     // Determine the version to install/update to.
     let mut target_version = entry.latest_version.clone();
 
     let should_proceed = if local_ver.is_none() {
-        println!("\n{} is not installed.", game_name);
+        println!("\n{} is not installed.", product_name);
 
         // Let the user pick a specific version for a fresh install.
         if !entry.versions.is_empty() {
@@ -94,14 +94,14 @@ async fn main() -> Result<()> {
         let current = local_ver.unwrap();
         print!(
             "{} update available! ({} -> {}). Update now? (y/n): ",
-            game_name, current, entry.latest_version
+            product_name, current, entry.latest_version
         );
         target_version = entry.latest_version.clone();
         true
     } else {
         println!(
             "{} is already up to date (Version {}).",
-            game_name, entry.latest_version
+            product_name, entry.latest_version
         );
         return Ok(());
     };
@@ -112,11 +112,11 @@ async fn main() -> Result<()> {
         io::stdin().read_line(&mut confirm)?;
 
         if confirm.trim().to_lowercase() == "y" {
-            println!("\nStarting process for {} v{}...", game_name, target_version);
+            println!("\nStarting process for {} v{}...", product_name, target_version);
 
             let wall_start = Instant::now();
 
-            match updater.perform_update(game_name, &target_version).await {
+            match updater.perform_update(product_name, &target_version).await {
                 Ok(stats) => {
                     let wall_time = wall_start.elapsed();
                     println!("\nInstallation/Update finished successfully!");

@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "patcher_cli",
+    "updater_cli"
+]
+
+resolver = "2"

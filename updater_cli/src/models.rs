@@ -4,11 +4,11 @@ use std::collections::HashMap;
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct RootJson {
     #[serde(default)]
-    pub games: HashMap<String, GameEntry>,
+    pub products: HashMap<String, ProductEntry>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct GameEntry {
+pub struct ProductEntry {
     pub latest_version: String,
     pub manifest: String,
     #[serde(default)]

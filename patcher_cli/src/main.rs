@@ -11,7 +11,7 @@ use std::fs::{self, File};
 use std::path::PathBuf;
 
 use args::Args;
-use models::{FileEntry, GameEntry, Manifest, PatchInfo, RootJson};
+use models::{FileEntry, ProductEntry, Manifest, PatchInfo, RootJson};
 use utils::{collect_files, file_blake3, generate_patch};
 
 fn main() -> Result<()> {
@@ -30,11 +30,11 @@ fn main() -> Result<()> {
     let mut previous_version_dir = PathBuf::new();
     let mut has_previous_version = false;
 
-    if let Some(entry) = root.games.get(&args.game) {
+    if let Some(entry) = root.products.get(&args.product) {
         println!("Detected previous version: {}", entry.latest_version);
         previous_version_dir = args.output
-            .join("games")
-            .join(&args.game)
+            .join("products")
+            .join(&args.product)
             .join(&entry.latest_version)
             .join("full");
 
@@ -46,9 +46,9 @@ fn main() -> Result<()> {
     }
 
     // Prepare Output Directories
-    let game_output_base = args.output.join("games").join(&args.game).join(&args.version);
-    let full_output_dir = game_output_base.join("full");
-    let patch_output_dir = game_output_base.join("patches");
+    let product_output_base = args.output.join("products").join(&args.product).join(&args.version);
+    let full_output_dir = product_output_base.join("full");
+    let patch_output_dir = product_output_base.join("patches");
 
     fs::create_dir_all(&full_output_dir)?;
     if has_previous_version {
@@ -158,26 +158,26 @@ fn main() -> Result<()> {
         total_patch_size: final_patch_size,
     };
 
-    let manifest_path = game_output_base.join("manifest.json");
+    let manifest_path = product_output_base.join("manifest.json");
     let manifest_file = File::create(&manifest_path)?;
     serde_json::to_writer_pretty(manifest_file, &manifest)?;
     println!("Manifest generated: {:?}", manifest_path);
 
     // Update root.json
-    let mut entry = root.games.entry(args.game.clone()).or_insert(GameEntry {
+    let mut entry = root.products.entry(args.product.clone()).or_insert(ProductEntry {
         latest_version: String::new(),
         manifest: String::new(),
         versions: Vec::new(),
     }).clone();
 
     entry.latest_version = args.version.clone();
-    entry.manifest = format!("games/{}/{}/manifest.json", args.game, args.version);
+    entry.manifest = format!("products/{}/{}/manifest.json", args.product, args.version);
 
     if !entry.versions.contains(&args.version) {
         entry.versions.push(args.version.clone());
     }
 
-    root.games.insert(args.game, entry);
+    root.products.insert(args.product, entry);
 
     let root_file = File::create(root_path)?;
     serde_json::to_writer_pretty(root_file, &root)?;

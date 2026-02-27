@@ -93,12 +93,12 @@ impl AtomicStats {
     }
 }
 
-pub struct GameUpdater {
+pub struct ProductUpdater {
     base_url: String,
     client: Client,
 }
 
-impl GameUpdater {
+impl ProductUpdater {
     pub fn new(base_url: &str) -> Self {
         Self {
             base_url: base_url.to_string(),
@@ -106,7 +106,7 @@ impl GameUpdater {
         }
     }
 
-    /// Fetch the server's root manifest listing all available games.
+    /// Fetch the server's root manifest listing all available products.
     pub async fn fetch_root(&self) -> Result<RootJson> {
         let url = format!("{}root.json", self.base_url);
         self.client
@@ -119,25 +119,25 @@ impl GameUpdater {
             .context("Failed to parse root.json")
     }
 
-    /// Read the locally installed version for a game, if any.
-    pub fn get_local_version(game: &str) -> Option<String> {
-        let path = PathBuf::from("games").join(game).join("version.json");
+    /// Read the locally installed version for a product, if any.
+    pub fn get_local_version(product: &str) -> Option<String> {
+        let path = PathBuf::from("products").join(product).join("version.json");
         let data = fs::read_to_string(path).ok()?;
         let json: serde_json::Value = serde_json::from_str(&data).ok()?;
         json["version"].as_str().map(str::to_string)
     }
 
-    /// Download and apply all file changes for `game_name` to reach `target_version`.
+    /// Download and apply all file changes for `product_name` to reach `target_version`.
     /// Returns benchmark statistics for the completed run.
     pub async fn perform_update(
         &self,
-        game_name: &str,
+        product_name: &str,
         target_version: &str,
     ) -> Result<UpdateStats> {
-        let manifest = self.fetch_manifest(game_name, target_version).await?;
+        let manifest = self.fetch_manifest(product_name, target_version).await?;
 
-        let game_dir = PathBuf::from("games").join(game_name);
-        fs::create_dir_all(&game_dir).context("Failed to create game directory")?;
+        let product_dir = PathBuf::from("products").join(product_name);
+        fs::create_dir_all(&product_dir).context("Failed to create product directory")?;
         fs::create_dir_all("temp").context("Failed to create temp directory")?;
 
         let stats = Arc::new(AtomicStats::default());
@@ -149,18 +149,18 @@ impl GameUpdater {
             .map(|(rel_path, file_entry)| {
                 let client = self.client.clone();
                 let base_url = self.base_url.clone();
-                let game_name = game_name.to_string();
+                let product_name = product_name.to_string();
                 let version = manifest.version.clone();
-                let game_dir = game_dir.clone();
+                let product_dir = product_dir.clone();
                 let stats = Arc::clone(&stats);
 
                 async move {
                     update_file(
                         &client,
                         &base_url,
-                        &game_name,
+                        &product_name,
                         &version,
-                        &game_dir,
+                        &product_dir,
                         &rel_path,
                         &file_entry,
                         &stats,
@@ -180,7 +180,7 @@ impl GameUpdater {
         // Persist the new version marker.
         let version_json =
             serde_json::to_string_pretty(&serde_json::json!({ "version": manifest.version }))?;
-        fs::write(game_dir.join("version.json"), version_json)
+        fs::write(product_dir.join("version.json"), version_json)
             .context("Failed to write version.json")?;
 
         let _ = fs::remove_dir_all("temp");
@@ -190,16 +190,16 @@ impl GameUpdater {
             .snapshot())
     }
 
-    async fn fetch_manifest(&self, game_name: &str, version: &str) -> Result<Manifest> {
+    async fn fetch_manifest(&self, product_name: &str, version: &str) -> Result<Manifest> {
         let url = format!(
-            "{}games/{}/{}/manifest.json",
-            self.base_url, game_name, version
+            "{}products/{}/{}/manifest.json",
+            self.base_url, product_name, version
         );
         self.client
             .get(&url)
             .send()
             .await
-            .with_context(|| format!("Failed to fetch manifest for {} v{}", game_name, version))?
+            .with_context(|| format!("Failed to fetch manifest for {} v{}", product_name, version))?
             .json()
             .await
             .context("Failed to parse manifest.json")
@@ -313,7 +313,7 @@ async fn download_to(
     }
 }
 
-/// Ensure a single game file is at the correct version and record stats.
+/// Ensure a single product file is at the correct version and record stats.
 ///
 /// Strategy (in order of preference):
 /// 1. **Skip** — file already matches the expected hash -> nothing to do.
@@ -324,14 +324,14 @@ async fn download_to(
 async fn update_file(
     client: &Client,
     base_url: &str,
-    game_name: &str,
+    product_name: &str,
     version: &str,
-    game_dir: &Path,
+    product_dir: &Path,
     rel_path: &str,
     entry: &FileEntry,
     stats: &AtomicStats,
 ) -> Result<()> {
-    let dest = game_dir.join(rel_path);
+    let dest = product_dir.join(rel_path);
 
     // Ensure parent directories exist
     if let Some(parent) = dest.parent() {
@@ -348,8 +348,8 @@ async fn update_file(
     // Binary patch available and old file present?
     if let (Some(patch_info), true) = (&entry.patch, dest.exists()) {
         let patch_url = format!(
-            "{}games/{}/{}/{}",
-            base_url, game_name, version, patch_info.file
+            "{}products/{}/{}/{}",
+            base_url, product_name, version, patch_info.file
         );
 
         let safe_temp_name = rel_path.replace("/", "_").replace("\\", "_");
@@ -373,8 +373,8 @@ async fn update_file(
 
     // Full download fallback
     let full_url = format!(
-        "{}games/{}/{}/full/{}",
-        base_url, game_name, version, rel_path
+        "{}products/{}/{}/full/{}",
+        base_url, product_name, version, rel_path
     );
     let (full_bytes, streamed) = download_to(client, &full_url, &dest, entry.size).await?;
 

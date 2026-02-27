@@ -5,9 +5,9 @@ use std::path::PathBuf;
 #[command(author, version, about, long_about = None)]
 #[command(disable_version_flag = true)]
 pub struct  Args {
-    /// Game name (key)
+    /// Product name (key)
     #[arg(short, long)]
-    pub game: String,
+    pub product: String,
 
     /// Path to the directory containing the NEW version files
     #[arg(short = 'n', long)]
@@ -17,11 +17,11 @@ pub struct  Args {
     #[arg(short = 'v', long)]
     pub version: String,
 
-    /// Path to the game executable relative to game root
+    /// Path to the product executable relative to product root
     #[arg(short, long)]
     pub exe: String,
 
-    /// Output root folder (where games/ and root.json will be stored)
+    /// Output root folder (where products/ and root.json will be stored)
     #[arg(short = 'o', long)]
     pub output: PathBuf,
 }
