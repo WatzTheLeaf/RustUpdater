@@ -5,6 +5,8 @@ use futures::stream::{self, StreamExt};
 use reqwest::Client;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Files larger than this are written to disk via streaming instead of being
@@ -30,14 +32,7 @@ impl ProductUpdater {
     /// Fetch the server's root manifest listing all available products.
     pub async fn fetch_root(&self) -> Result<RootJson> {
         let url = format!("{}root.json", self.base_url);
-        self.client
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to reach update server")?
-            .json()
-            .await
-            .context("Failed to parse root.json")
+        self.client.get(&url).send().await?.json().await.context("Failed to parse root.json")
     }
 
     /// Read the locally installed version for a product, if any.
@@ -48,23 +43,29 @@ impl ProductUpdater {
         json["version"].as_str().map(str::to_string)
     }
 
+    /// Fetch a specific version's manifest for a product.
+    pub async fn fetch_manifest(&self, product_name: &str, version: &str) -> Result<Manifest> {
+        let url = format!("{}products/{}/{}/manifest.json", self.base_url, product_name, version);
+        self.client.get(&url).send().await?.json().await.context("Failed to parse manifest.json")
+    }
+
     /// Initiates an update to a specific target version.
     /// It calculates the optimal sequential patch path based on the root.json versions array.
-    pub async fn perform_update(
+    pub async fn perform_update<F>(
         &self,
         product_name: &str,
         target_version: &str,
         available_versions: &[String],
-    ) -> Result<()> {
+        on_progress: F,
+    ) -> Result<()>
+    where
+        F: Fn(usize, usize) + Send + Sync + Clone + 'static,
+    {
         let current_version = Self::get_local_version(product_name).unwrap_or_else(|| "0.0.0".to_string());
-
-        if current_version == target_version {
-            return Ok(()); // Already up to date
-        }
+        if current_version == target_version { return Ok(()); } // Already up to date
 
         // Calculate the update path
         let mut update_path = Vec::new();
-
         if let Some(current_idx) = available_versions.iter().position(|v| v == &current_version) {
             if let Some(target_idx) = available_versions.iter().position(|v| v == target_version) {
                 if current_idx < target_idx {
@@ -80,31 +81,19 @@ impl ProductUpdater {
             update_path = vec![target_version.to_string()];
         }
 
-        self.perform_update_path(product_name, &update_path).await
-    }
-
-    /// Fetch a specific version's manifest for a product.
-    async fn fetch_manifest(&self, product_name: &str, version: &str) -> Result<Manifest> {
-        let url = format!(
-            "{}products/{}/{}/manifest.json",
-            self.base_url, product_name, version
-        );
-        self.client
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("Failed to fetch manifest for {} v{}", product_name, version))?
-            .json()
-            .await
-            .context("Failed to parse manifest.json")
+        self.perform_update_path(product_name, &update_path, on_progress).await
     }
 
     /// Internal method that executes the determined update path
-    async fn perform_update_path(
+    async fn perform_update_path<F>(
         &self,
         product_name: &str,
         update_path: &[String],
-    ) -> Result<()> {
+        on_progress: F,
+    ) -> Result<()>
+    where
+        F: Fn(usize, usize) + Send + Sync + Clone + 'static,
+    {
         let target_version = update_path.last().unwrap();
         let target_manifest = self.fetch_manifest(product_name, target_version).await?;
 
@@ -128,30 +117,30 @@ impl ProductUpdater {
         // Calculate the cumulative cost of intermediate patches using the new struct field
         let total_patch_cost: u64 = manifests.iter().map(|m| m.total_patch_size).sum();
 
+        // Calculate total files for the progress bar across all manifests
+        let total_files: usize = if total_patch_cost > 0 && total_patch_cost < full_size {
+            manifests.iter().map(|m| m.files.len()).sum()
+        } else {
+            target_manifest.files.len()
+        };
+
+        let completed_files = Arc::new(AtomicUsize::new(0));
+
         // Evaluate strategy
         // We only patch if the total patch cost is strictly less than a full download.
         // Also if total_patch_cost is 0, it means no patches exist, so we force a full download.
         if total_patch_cost > 0 && total_patch_cost < full_size {
-            println!(
-                "-> Patch cost ({} bytes) is cheaper than full download ({} bytes). Applying sequentially...",
-                total_patch_cost, full_size
-            );
-
+            println!("-> Patch cost ({} bytes) is cheaper than full download ({} bytes). Applying sequentially...", total_patch_cost, full_size);
             for manifest in manifests {
                 println!("-> Applying update for version {}...", manifest.version);
-                self.apply_manifest(product_name, &manifest, &product_dir, true).await?;
-
+                self.apply_manifest(product_name, &manifest, &product_dir, true, completed_files.clone(), total_files, on_progress.clone()).await?;
                 // Save intermediate version progression in case of unexpected closure
                 Self::save_local_version(&product_dir, &manifest.version)?;
             }
         } else {
-            println!(
-                "-> Patch cost ({} bytes) exceeds full download ({} bytes) or patches are missing. Forcing full download...",
-                total_patch_cost, full_size
-            );
-
+            println!("-> Patch cost ({} bytes) exceeds full download ({} bytes) or patches are missing. Forcing full download...", total_patch_cost, full_size);
             // Apply the final manifest directly with patching disabled to force a fresh download
-            self.apply_manifest(product_name, &target_manifest, &product_dir, false).await?;
+            self.apply_manifest(product_name, &target_manifest, &product_dir, false, completed_files, total_files, on_progress).await?;
             Self::save_local_version(&product_dir, target_version)?;
         }
 
@@ -160,13 +149,19 @@ impl ProductUpdater {
     }
 
     /// Process a single manifest concurrently
-    async fn apply_manifest(
+    async fn apply_manifest<F>(
         &self,
         product_name: &str,
         manifest: &Manifest,
         product_dir: &Path,
         allow_patch: bool,
-    ) -> Result<()> {
+        completed_files: Arc<AtomicUsize>,
+        total_files: usize,
+        on_progress: F,
+    ) -> Result<()>
+    where
+        F: Fn(usize, usize) + Send + Sync + 'static,
+    {
         // Handle file deletions first if the manifest specifies them
         for deleted_file in &manifest.deleted_files {
             let file_path = product_dir.join(deleted_file);
@@ -175,7 +170,10 @@ impl ProductUpdater {
             }
         }
 
-        let results = stream::iter(&manifest.files)
+        let owned_files = manifest.files.clone().into_iter();
+        let on_progress = Arc::new(on_progress);
+
+        let results = stream::iter(owned_files)
             .map(|(rel_path, file_entry)| {
                 let client = self.client.clone();
                 let base_url = self.base_url.clone();
@@ -183,52 +181,50 @@ impl ProductUpdater {
                 let version = manifest.version.clone();
                 let product_dir = product_dir.to_path_buf();
 
-                let rel_path = rel_path.clone();
-                let file_entry = file_entry.clone();
+                // Clone our progress trackers for this specific async task
+                let completed_clone = completed_files.clone();
+                let prog_clone = Arc::clone(&on_progress);
 
                 async move {
-                    update_file(
-                        &client,
-                        &base_url,
-                        &product_name,
-                        &version,
-                        &product_dir,
-                        &rel_path,
-                        &file_entry,
-                        allow_patch,
-                    )
-                        .await
+                    let res = update_file(&client, &base_url, &product_name, &version, &product_dir, &rel_path, &file_entry, allow_patch).await;
+
+                    // Atomically increment the completed files counter and trigger the callback
+                    let current = completed_clone.fetch_add(1, Ordering::Relaxed) + 1;
+                    prog_clone(current, total_files);
+
+                    res
                 }
             })
             .buffer_unordered(CONCURRENCY)
             .collect::<Vec<_>>()
             .await;
 
-        for result in results {
-            result?; // Propagate the first error encountered, if any
-        }
-
+        for result in results { result?; } // Propagate the first error encountered, if any
         Ok(())
     }
 
     fn save_local_version(product_dir: &Path, version: &str) -> Result<()> {
         let version_json = serde_json::to_string_pretty(&serde_json::json!({ "version": version }))?;
-        fs::write(product_dir.join("version.json"), version_json)
-            .context("Failed to write version.json")?;
+        fs::write(product_dir.join("version.json"), version_json).context("Failed to write version.json")?;
         Ok(())
     }
 
-    /// Verify the integrity of a locally installed product against it's manifest
-    pub async fn verify_integrity(&self, product_name: &str, version: &str) -> Result<Vec<String>> {
+    /// Verify the integrity of a locally installed product against its manifest
+    pub async fn verify_integrity<F>(&self, product_name: &str, version: &str, on_progress: F) -> Result<Vec<String>>
+    where
+        F: Fn(usize, usize) + Send + Sync + 'static,
+    {
         println!("Fetching manifest to verify {} v{}...", product_name, version);
         let manifest = self.fetch_manifest(product_name, version).await?;
         let product_dir = PathBuf::from("products").join(product_name);
 
-        if !product_dir.exists() {
-            return Err(anyhow::anyhow!("Product directory does not exist."));
-        }
+        if !product_dir.exists() { return Err(anyhow::anyhow!("Product directory does not exist.")); }
 
         println!("Verifying {} files. This may take a moment...", manifest.files.len());
+
+        let total_files = manifest.files.len();
+        let completed_files = Arc::new(AtomicUsize::new(0));
+        let on_progress = Arc::new(on_progress);
 
         // Process file hashing concurrently
         let corrupted_files: Vec<String> = stream::iter(manifest.files)
@@ -237,20 +233,25 @@ impl ProductUpdater {
                 let expected_hash = entry.hash.clone();
                 let rel_path_clone = rel_path.clone();
 
+                let completed_clone = completed_files.clone();
+                let prog_clone = Arc::clone(&on_progress);
+
                 async move {
-                    tokio::task::spawn_blocking(move || {
-                        if !path.exists() {
-                            return Some(rel_path_clone);
-                        }
+                    let res = tokio::task::spawn_blocking(move || {
+                        if !path.exists() { return Some(rel_path_clone); }
 
                         // Hash the file and compare
                         match file_hash(&path) {
                             Ok(hash) if hash == expected_hash => None,
                             _ => Some(rel_path_clone),
                         }
-                    })
-                        .await
-                        .expect("Blocking task panicked")
+                    }).await.expect("Blocking task panicked");
+
+                    // Atomically increment and report progress
+                    let current = completed_clone.fetch_add(1, Ordering::Relaxed) + 1;
+                    prog_clone(current, total_files);
+
+                    res
                 }
             })
             .buffer_unordered(CONCURRENCY)
@@ -264,22 +265,16 @@ impl ProductUpdater {
 
 /// Compute the BLAKE3 hash of a file on disk.
 fn file_hash(path: &Path) -> Result<String> {
-    let mut file = fs::File::open(path)
-        .with_context(|| format!("Failed to open file for hashing: {}", path.display()))?;
+    let mut file = fs::File::open(path).with_context(|| format!("Failed to open file for hashing: {}", path.display()))?;
     let mut hasher = blake3::Hasher::new();
     std::io::copy(&mut file, &mut hasher)?;
     Ok(hasher.finalize().to_hex().to_string())
 }
 
 /// Apply an HDiffPatch binary patch using the native Rust library.
-async fn apply_patch(
-    old_path: PathBuf,
-    patch_path: PathBuf,
-    out_path: PathBuf,
-) -> Result<(i32, Duration)> {
+async fn apply_patch(old_path: PathBuf, patch_path: PathBuf, out_path: PathBuf) -> Result<(i32, Duration)> {
     tokio::task::spawn_blocking(move || {
         let t0 = Instant::now();
-
         let is_in_place = old_path == out_path;
         let actual_out_path = if is_in_place {
             // Append the tmp_patch, don't remove the existing file extension,
@@ -309,41 +304,23 @@ async fn apply_patch(
 
         let ret = if success { 0 } else { 1 };
         Ok((ret, t0.elapsed()))
-    })
-        .await
-        .context("Patch task panicked")?
+    }).await.context("Patch task panicked")?
 }
 
 /// Download a URL and write it to `dest`.
-async fn download_to(
-    client: &Client,
-    url: &str,
-    dest: &Path,
-    known_size: u64,
-) -> Result<()> {
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .with_context(|| format!("Failed to download {}", url))?;
-
+async fn download_to(client: &Client, url: &str, dest: &Path, known_size: u64) -> Result<()> {
+    let response = client.get(url).send().await.with_context(|| format!("Failed to download {}", url))?;
     let streamed = known_size >= STREAM_THRESHOLD;
 
     if !streamed {
-        let bytes = response
-            .bytes()
-            .await
-            .with_context(|| format!("Failed to read response body from {}", url))?;
-        fs::write(dest, bytes)
-            .with_context(|| format!("Failed to write {}", dest.display()))?;
+        let bytes = response.bytes().await.with_context(|| format!("Failed to read response body from {}", url))?;
+        fs::write(dest, bytes).with_context(|| format!("Failed to write {}", dest.display()))?;
     } else {
-        let mut file = fs::File::create(dest)
-            .with_context(|| format!("Failed to create {}", dest.display()))?;
+        let mut file = fs::File::create(dest).with_context(|| format!("Failed to create {}", dest.display()))?;
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.with_context(|| format!("Stream error from {}", url))?;
-            std::io::Write::write_all(&mut file, &chunk)
-                .with_context(|| format!("Failed to write chunk to {}", dest.display()))?;
+            std::io::Write::write_all(&mut file, &chunk).with_context(|| format!("Failed to write chunk to {}", dest.display()))?;
         }
     }
     Ok(())
@@ -351,36 +328,19 @@ async fn download_to(
 
 /// Ensure a single product file is at the correct version.
 #[allow(clippy::too_many_arguments)]
-async fn update_file(
-    client: &Client,
-    base_url: &str,
-    product_name: &str,
-    version: &str,
-    product_dir: &Path,
-    rel_path: &str,
-    entry: &FileEntry,
-    allow_patch: bool,
-) -> Result<()> {
+async fn update_file(client: &Client, base_url: &str, product_name: &str, version: &str, product_dir: &Path, rel_path: &str, entry: &FileEntry, allow_patch: bool) -> Result<()> {
     let dest = product_dir.join(rel_path);
-
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("Failed to create directory {}", parent.display()))?;
     }
 
     // Already up to date?
-    if dest.exists() && file_hash(&dest).unwrap_or_default() == entry.hash {
-        return Ok(());
-    }
+    if dest.exists() && file_hash(&dest).unwrap_or_default() == entry.hash { return Ok(()); }
 
     // Binary patch available and permitted by the active strategy?
     if allow_patch {
         if let (Some(patch_info), true) = (&entry.patch, dest.exists()) {
-            let patch_url = format!(
-                "{}products/{}/{}/{}",
-                base_url, product_name, version, patch_info.file
-            );
-
+            let patch_url = format!("{}products/{}/{}/{}", base_url, product_name, version, patch_info.file);
             let safe_temp_name = rel_path.replace("/", "_").replace("\\", "_");
             let patch_dest = PathBuf::from("temp").join(format!("{}.patch", safe_temp_name));
 
@@ -397,11 +357,7 @@ async fn update_file(
     }
 
     // Full download fallback
-    let full_url = format!(
-        "{}products/{}/{}/full/{}",
-        base_url, product_name, version, rel_path
-    );
+    let full_url = format!("{}products/{}/{}/full/{}", base_url, product_name, version, rel_path);
     download_to(client, &full_url, &dest, entry.size).await?;
-
     Ok(())
 }

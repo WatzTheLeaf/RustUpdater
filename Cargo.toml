@@ -1,7 +1,8 @@
 [workspace]
 members = [
     "patcher_cli",
-    "updater_cli"
+    "updater",
+    "launcher/src-tauri"
 ]
 
 resolver = "2"
