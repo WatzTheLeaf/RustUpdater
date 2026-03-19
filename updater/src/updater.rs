@@ -31,6 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
 
 /// Files larger than this are written to disk via streaming instead of being
 /// loaded entirely into RAM first.
@@ -344,13 +345,13 @@ async fn download_to(client: &Client, url: &str, dest: &Path, known_size: u64) -
 
     if !streamed {
         let bytes = response.bytes().await.with_context(|| format!("Failed to read response body from {}", url))?;
-        fs::write(dest, bytes).with_context(|| format!("Failed to write {}", dest.display()))?;
+        tokio::fs::write(dest, bytes).await.with_context(|| format!("Failed to write {}", dest.display()))?;
     } else {
-        let mut file = fs::File::create(dest).with_context(|| format!("Failed to create {}", dest.display()))?;
+        let mut file = tokio::fs::File::create(dest).await.with_context(|| format!("Failed to create {}", dest.display()))?;
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.with_context(|| format!("Stream error from {}", url))?;
-            std::io::Write::write_all(&mut file, &chunk).with_context(|| format!("Failed to write chunk to {}", dest.display()))?;
+            file.write_all(&chunk).await.with_context(|| format!("Failed to write chunk to {}", dest.display()))?;
         }
     }
     Ok(())
