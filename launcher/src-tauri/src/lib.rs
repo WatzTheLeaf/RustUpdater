@@ -21,16 +21,182 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::Mutex;
+use tauri::{Emitter, AppHandle};
+use updater::models::RootJson;
+use updater::ProductUpdater;
+use serde::Serialize;
+
+struct UpdaterConfig {
+    server_url: Mutex<String>,
+    install_dir: Mutex<PathBuf>,
+}
+
+#[derive(Clone, Serialize)]
+struct ProgressPayload {
+    current: usize,
+    total: usize,
+    percent: f64,
+}
+
+/// Validates the server URL, ensuring it ends with '/'
 #[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
+fn validate_server_url(mut url: String) -> Result<String, String> {
+    if url.trim().is_empty() {
+        return Err(String::from("server url is empty"));
+    }
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err("URL must start with http:// or https://".into());
+    }
+    if !url.ends_with('/') {
+        url.push('/');
+    }
+    Ok(url)
+}
+
+#[tauri::command]
+async fn fetch_root(state: tauri::State<'_, UpdaterConfig>) -> Result<RootJson, String> {
+    let url = state.server_url.lock().unwrap().clone();
+    let dir = state.install_dir.lock().unwrap().clone();
+
+    let updater = ProductUpdater::new(&url, dir);
+    updater.fetch_root().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_local_version(state: tauri::State<'_, UpdaterConfig>, product_name: String) -> Option<String> {
+    let url = state.server_url.lock().unwrap().clone();
+    let dir = state.install_dir.lock().unwrap().clone();
+
+    let updater = ProductUpdater::new(&url, dir);
+    updater.get_local_version(&product_name)
+}
+
+#[tauri::command]
+async fn run_update(
+    app: AppHandle,
+    state: tauri::State<'_, UpdaterConfig>,
+    product_name: String,
+    target_version: String,
+    available_versions: Vec<String>,
+) -> Result<String, String> {
+    let url = state.server_url.lock().unwrap().clone();
+    let dir = state.install_dir.lock().unwrap().clone();
+
+    let updater = ProductUpdater::new(&url, dir);
+    let _ = app.emit("log", format!("Starting update for {} to v{}...", product_name, target_version));
+
+    let app_clone = app.clone();
+
+    let progress_callback = move |current: usize, total: usize| {
+        let percent = if total > 0 { (current as f64 / total as f64) * 100.0 } else { 100.0 };
+        let payload = ProgressPayload { current, total, percent };
+        let _ = app_clone.emit("progress", payload);
+    };
+
+    match updater.perform_update(&product_name, &target_version, &available_versions, progress_callback).await {
+        Ok(_) => {
+            let _ = app.emit("log", "Update finished successfully!".to_string());
+            Ok("Success".into())
+        }
+        Err(e) => {
+            let err_msg = format!("Update failed: {}", e);
+            let _ = app.emit("log", err_msg.clone());
+            Err(err_msg)
+        }
+    }
+}
+
+#[tauri::command]
+async fn verify_integrity(
+    app: AppHandle,
+    state: tauri::State<'_, UpdaterConfig>,
+    product_name: String,
+    version: String,
+) -> Result<Vec<String>, String> {
+    let url = state.server_url.lock().unwrap().clone();
+    let dir = state.install_dir.lock().unwrap().clone();
+
+    let updater = ProductUpdater::new(&url, dir);
+    let _ = app.emit("log", format!("Verifying files for {} v{}...", product_name, version));
+
+    let app_clone = app.clone();
+    let progress_callback = move |current: usize, total: usize| {
+        let percent = if total > 0 { (current as f64 / total as f64) * 100.0 } else { 100.0 };
+        let payload = ProgressPayload { current, total, percent };
+        let _ = app_clone.emit("progress", payload);
+    };
+
+    match updater.verify_integrity(&product_name, &version, progress_callback).await {
+        Ok(corrupted) => {
+            if corrupted.is_empty() {
+                let _ = app.emit("log", "Integrity check passed! All files 100% correct.".to_string());
+            } else {
+                let _ = app.emit("log", format!("CRITICAL: Found {} corrupted files.", corrupted.len()));
+            }
+            Ok(corrupted)
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
+async fn launch_product(
+    state: tauri::State<'_, UpdaterConfig>,
+    product_name: String,
+) -> Result<String, String> {
+    let url = state.server_url.lock().unwrap().clone();
+    let dir = state.install_dir.lock().unwrap().clone();
+
+    let updater = ProductUpdater::new(&url, &dir);
+
+    let local_ver = updater.get_local_version(&product_name)
+        .ok_or("Product is not installed.")?;
+
+    let manifest = updater.fetch_manifest(&product_name, &local_ver).await
+        .map_err(|e| format!("Failed to read manifest: {}", e))?;
+
+    if manifest.exe.is_empty() {
+        return Err("No executable specified in the server manifest.".into());
+    }
+
+    let exe_path = dir
+        .join(&product_name)
+        .join(&manifest.exe);
+
+    if !exe_path.exists() {
+        return Err(format!("Executable not found at: {}", exe_path.display()));
+    }
+
+    Command::new(&exe_path)
+        .current_dir(exe_path.parent().unwrap())
+        .spawn()
+        .map_err(|e| format!("Failed to launch product: {}", e))?;
+
+    Ok("Launched successfully!".into())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let default_url = "https://your-server.com/".to_string();
+    let default_install_dir = std::env::current_dir().unwrap().join("products");
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet])
+        .manage(UpdaterConfig {
+            server_url: Mutex::new(default_url),
+            install_dir: Mutex::new(default_install_dir),
+        })
+        .invoke_handler(tauri::generate_handler![
+            validate_server_url,
+            fetch_root,
+            get_local_version,
+            run_update,
+            verify_integrity,
+            launch_product
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
