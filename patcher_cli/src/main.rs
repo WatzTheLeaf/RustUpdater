@@ -80,7 +80,7 @@ fn main() -> Result<()> {
 
     // Scan New Files
     println!("Scanning files...");
-    let new_files_list = collect_files(&args.new_dir)?;
+    let new_files_list = collect_files(&args.input)?;
 
     // Arc<Mutex> to safely share counters across threads
     let full_size = Arc::new(Mutex::new(0u64));
@@ -92,7 +92,7 @@ fn main() -> Result<()> {
     let file_entries_map: HashMap<String, FileEntry> = new_files_list
         .par_iter()
         .map(|rel_path| {
-            let src_path = args.new_dir.join(rel_path);
+            let src_path = args.input.join(rel_path);
             let dest_path = full_output_dir.join(rel_path);
 
             // Copy full file

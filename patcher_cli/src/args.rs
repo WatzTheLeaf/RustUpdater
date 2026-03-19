@@ -32,9 +32,9 @@ pub struct  Args {
     #[arg(short, long)]
     pub product: String,
 
-    /// Path to the directory containing the NEW version files
+    /// Path to the directory containing the version files
     #[arg(short = 'n', long)]
-    pub new_dir: PathBuf,
+    pub input: PathBuf,
 
     /// The new version string (e.g., "1.0.1")
     #[arg(short = 'v', long)]
