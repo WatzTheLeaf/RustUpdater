@@ -146,6 +146,37 @@ impl ProductUpdater {
         // Calculate the cumulative cost of intermediate patches using the new struct field
         let total_patch_cost: u64 = manifests.iter().map(|m| m.total_patch_size).sum();
 
+        // Find the size of the largest single file
+        let largest_file_size: u64 = target_manifest.files.values().map(|f| f.size).max().unwrap_or(0);
+
+        // Check if space is available
+        let is_installed = self.get_local_version(product_name).is_some();
+
+        let required_space = if !is_installed {
+            // Scenario A: Fresh install. We need the full size + 100MB buffer
+            full_size + (100 * 1024 * 1024)
+        } else if total_patch_cost > 0 && total_patch_cost < full_size {
+            // Scenario B: Patching. We need space for the downloaded patches + room to write the largest temporary file
+            total_patch_cost + largest_file_size + (100 * 1024 * 1024)
+        } else {
+            // Scenario C: Update falling back to full downloads.
+            // It skips files that already exist, so we estimate space for the largest file to download + 1GB buffer.
+            largest_file_size + (1024 * 1024 * 1024)
+        };
+
+        let dir = self.install_dir.clone();
+        let available_space = tokio::task::spawn_blocking(move || {
+            fs4::available_space(&dir)
+        }).await.context("Thread panicked")?.context("Failed to read disk space")?;
+
+        if available_space < required_space {
+            return Err(anyhow::anyhow!(
+                "INSUFFICIENT_SPACE:{}:{}",
+                required_space,
+                available_space
+            ));
+        }
+
         // Calculate total files for the progress bar across all manifests
         let total_files: usize = if total_patch_cost > 0 && total_patch_cost < full_size {
             manifests.iter().map(|m| m.files.len()).sum()

@@ -80,9 +80,26 @@ async function updateProduct() {
     progressData.value.percent = 100;
     await selectProduct(selectedProductName.value);
   } catch (err: any) {
-    logs.value.push(`ERROR: ${err}`);
+    const errorString = String(err);
+
+    // Check if the error is our custom disk space error from Rust
+    if (errorString.includes("INSUFFICIENT_SPACE")) {
+      const parts = errorString.split(":");
+      const reqBytes = parseInt(parts[1]);
+      const availBytes = parseInt(parts[2]);
+
+      const reqGb = (reqBytes / 1024 / 1024 / 1024).toFixed(2);
+      const availGb = (availBytes / 1024 / 1024 / 1024).toFixed(2);
+
+      const msg = `Not enough disk space! You need at least ${reqGb} GB, but only have ${availGb} GB available.`;
+      alert(msg);
+      logs.value.push(`CRITICAL ERROR: ${msg}`);
+    } else {
+      // It was a normal download/network error
+      logs.value.push(`ERROR: ${errorString}`);
+    }
   } finally {
-    setTimeout(() => { isBusy.value = false; }, 1000); // Give it a second to show 100%
+    setTimeout(() => { isBusy.value = false; }, 1000);
   }
 }
 
