@@ -120,7 +120,7 @@ impl ProductUpdater {
     where
         F: Fn(usize, usize) + Send + Sync + Clone + 'static,
     {
-        let target_version = update_path.last().unwrap();
+        let target_version = update_path.last().expect("update_path is guaranteed non-empty");
         let target_manifest = self.fetch_manifest(product_name, target_version).await?;
 
         let product_dir = self.install_dir.join(product_name);
