@@ -13,11 +13,6 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { Progress } from '@/components/ui/progress';
 
 // State
-const showUrlModal = ref(true);
-const serverUrlInput = ref('http://127.0.0.1:3000/');
-const serverUrl = ref('');
-const urlError = ref('');
-
 const products = ref<Record<string, any>>({});
 const selectedProductName = ref('');
 const selectedProductData = ref<any>(null);
@@ -41,23 +36,15 @@ onMounted(async () => {
   await listen<any>('progress', (event) => {
     progressData.value = event.payload;
   });
+
+  // Automatically fetch data on startup since Rust handles the URL now
+  await refreshData();
 });
 
-async function submitServerUrl() {
-  try {
-    urlError.value = '';
-    serverUrl.value = await invoke('validate_server_url', { url: serverUrlInput.value });
-    showUrlModal.value = false;
-    await refreshData();
-  } catch (err: any) {
-    urlError.value = err;
-  }
-}
-
 async function refreshData() {
-  if (!serverUrl.value) return;
   try {
-    const rootJson: any = await invoke('fetch_root', { serverUrl: serverUrl.value });
+    // No longer passing serverUrl
+    const rootJson: any = await invoke('fetch_root');
     products.value = rootJson.products || {};
 
     if (selectedProductName.value) {
@@ -73,6 +60,7 @@ async function selectProduct(name: string) {
   selectedProductData.value = products.value[name];
 
   targetInstallVersion.value = selectedProductData.value.latest_version;
+  // No longer passing serverUrl
   localVersion.value = await invoke('get_local_version', { productName: name });
 }
 
@@ -83,8 +71,8 @@ async function updateProduct() {
   logs.value.push(`--- Starting Update for ${selectedProductName.value} ---`);
 
   try {
+    // No longer passing serverUrl
     await invoke('run_update', {
-      serverUrl: serverUrl.value,
       productName: selectedProductName.value,
       targetVersion: targetInstallVersion.value || selectedProductData.value.latest_version,
       availableVersions: selectedProductData.value.versions
@@ -103,8 +91,8 @@ async function launchApp() {
   currentTaskName.value = 'Launching App';
   progressData.value = { current: 0, total: 0, percent: 100 }; // Fake full bar for launch
   try {
+    // No longer passing serverUrl
     await invoke('launch_product', {
-      serverUrl: serverUrl.value,
       productName: selectedProductName.value,
     });
   } catch (err: any) {
@@ -122,14 +110,16 @@ async function verifyFiles() {
   logs.value.push(`--- Starting Integrity Check ---`);
 
   try {
+    // No longer passing serverUrl
     const corruptedFiles: string[] = await invoke('verify_integrity', {
-      serverUrl: serverUrl.value,
       productName: selectedProductName.value,
       version: localVersion.value
     });
 
     if (corruptedFiles.length > 0) {
       logs.value.push(`Found ${corruptedFiles.length} corrupted files. Run an update to repair.`);
+    } else {
+      logs.value.push(`Integrity Check Passed! All files are fully valid.`);
     }
     progressData.value.percent = 100;
   } catch (err: any) {
@@ -258,30 +248,6 @@ async function verifyFiles() {
         Select a product from the menu to manage it.
       </div>
     </main>
-
-    <Dialog :open="showUrlModal" @update:open="(val) => { if(!showUrlModal) showUrlModal = val }">
-      <DialogContent class="sm:max-w-md" @pointer-down-outside.prevent @escape-key-down.prevent>
-        <DialogHeader>
-          <DialogTitle>Connect to Update Server</DialogTitle>
-          <DialogDescription>
-            Please provide the URL of your update server to continue.
-          </DialogDescription>
-        </DialogHeader>
-        <div class="flex items-center space-x-2">
-          <Input
-              v-model="serverUrlInput"
-              placeholder="http://127.0.0.1:3000/"
-              @keyup.enter="submitServerUrl"
-          />
-        </div>
-        <p v-if="urlError" class="text-destructive text-sm">{{ urlError }}</p>
-        <DialogFooter class="sm:justify-end">
-          <Button type="button" @click="submitServerUrl">
-            Connect
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
 
     <Dialog :open="showLogsModal" @update:open="showLogsModal = $event">
       <DialogContent class="max-w-3xl h-[70vh] flex flex-col">

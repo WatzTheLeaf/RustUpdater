@@ -42,13 +42,15 @@ const CONCURRENCY: usize = 8;
 pub struct ProductUpdater {
     base_url: String,
     client: Client,
+    install_dir: PathBuf,
 }
 
 impl ProductUpdater {
-    pub fn new(base_url: &str) -> Self {
+    pub fn new(base_url: &str, install_dir: impl Into<PathBuf>) -> Self {
         Self {
             base_url: base_url.to_string(),
             client: Client::new(),
+            install_dir: install_dir.into()
         }
     }
 
@@ -59,8 +61,8 @@ impl ProductUpdater {
     }
 
     /// Read the locally installed version for a product, if any.
-    pub fn get_local_version(product: &str) -> Option<String> {
-        let path = PathBuf::from("products").join(product).join("version.json");
+    pub fn get_local_version(&self, product: &str) -> Option<String> {
+        let path = self.install_dir.join(product).join("version.json");
         let data = fs::read_to_string(path).ok()?;
         let json: serde_json::Value = serde_json::from_str(&data).ok()?;
         json["version"].as_str().map(str::to_string)
@@ -84,7 +86,7 @@ impl ProductUpdater {
     where
         F: Fn(usize, usize) + Send + Sync + Clone + 'static,
     {
-        let current_version = Self::get_local_version(product_name).unwrap_or_else(|| "0.0.0".to_string());
+        let current_version = self.get_local_version(product_name).unwrap_or_else(|| "0.0.0".to_string());
         if current_version == target_version { return Ok(()); } // Already up to date
 
         // Calculate the update path
@@ -120,9 +122,12 @@ impl ProductUpdater {
         let target_version = update_path.last().unwrap();
         let target_manifest = self.fetch_manifest(product_name, target_version).await?;
 
-        let product_dir = PathBuf::from("products").join(product_name);
+        let product_dir = self.install_dir.join(product_name);
         fs::create_dir_all(&product_dir).context("Failed to create product directory")?;
-        fs::create_dir_all("temp").context("Failed to create temp directory")?;
+
+        // Define and create a dynamic temp directory inside the install_dir
+        let temp_dir = self.install_dir.join(".temp");
+        fs::create_dir_all(&temp_dir).context("Failed to create temp directory")?;
 
         // Fetch all manifests in the update path
         let mut manifests = Vec::new();
@@ -156,18 +161,18 @@ impl ProductUpdater {
             println!("-> Patch cost ({} bytes) is cheaper than full download ({} bytes). Applying sequentially...", total_patch_cost, full_size);
             for manifest in manifests {
                 println!("-> Applying update for version {}...", manifest.version);
-                self.apply_manifest(product_name, &manifest, &product_dir, true, completed_files.clone(), total_files, on_progress.clone()).await?;
+                self.apply_manifest(product_name, &manifest, &product_dir, &temp_dir, true, completed_files.clone(), total_files, on_progress.clone()).await?;
                 // Save intermediate version progression in case of unexpected closure
                 Self::save_local_version(&product_dir, &manifest.version)?;
             }
         } else {
             println!("-> Patch cost ({} bytes) exceeds full download ({} bytes) or patches are missing. Forcing full download...", total_patch_cost, full_size);
             // Apply the final manifest directly with patching disabled to force a fresh download
-            self.apply_manifest(product_name, &target_manifest, &product_dir, false, completed_files, total_files, on_progress).await?;
+            self.apply_manifest(product_name, &target_manifest, &product_dir, &temp_dir, false, completed_files, total_files, on_progress).await?;
             Self::save_local_version(&product_dir, target_version)?;
         }
 
-        let _ = fs::remove_dir_all("temp");
+        let _ = fs::remove_dir_all(&temp_dir);
         Ok(())
     }
 
@@ -177,6 +182,7 @@ impl ProductUpdater {
         product_name: &str,
         manifest: &Manifest,
         product_dir: &Path,
+        temp_dir: &Path,
         allow_patch: bool,
         completed_files: Arc<AtomicUsize>,
         total_files: usize,
@@ -203,13 +209,14 @@ impl ProductUpdater {
                 let product_name = product_name.to_string();
                 let version = manifest.version.clone();
                 let product_dir = product_dir.to_path_buf();
+                let temp_dir = temp_dir.to_path_buf();
 
                 // Clone our progress trackers for this specific async task
                 let completed_clone = completed_files.clone();
                 let prog_clone = Arc::clone(&on_progress);
 
                 async move {
-                    let res = update_file(&client, &base_url, &product_name, &version, &product_dir, &rel_path, &file_entry, allow_patch).await;
+                    let res = update_file(&client, &base_url, &product_name, &version, &product_dir, &temp_dir, &rel_path, &file_entry, allow_patch).await;
 
                     // Atomically increment the completed files counter and trigger the callback
                     let current = completed_clone.fetch_add(1, Ordering::Relaxed) + 1;
@@ -239,7 +246,7 @@ impl ProductUpdater {
     {
         println!("Fetching manifest to verify {} v{}...", product_name, version);
         let manifest = self.fetch_manifest(product_name, version).await?;
-        let product_dir = PathBuf::from("products").join(product_name);
+        let product_dir = self.install_dir.join(product_name);
 
         if !product_dir.exists() { return Err(anyhow::anyhow!("Product directory does not exist.")); }
 
@@ -351,36 +358,93 @@ async fn download_to(client: &Client, url: &str, dest: &Path, known_size: u64) -
 
 /// Ensure a single product file is at the correct version.
 #[allow(clippy::too_many_arguments)]
-async fn update_file(client: &Client, base_url: &str, product_name: &str, version: &str, product_dir: &Path, rel_path: &str, entry: &FileEntry, allow_patch: bool) -> Result<()> {
+async fn update_file(
+    client: &Client,
+    base_url: &str,
+    product_name: &str,
+    version: &str,
+    product_dir: &Path,
+    temp_dir: &Path,
+    rel_path: &str,
+    entry: &FileEntry,
+    allow_patch: bool
+) -> Result<()> {
     let dest = product_dir.join(rel_path);
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).with_context(|| format!("Failed to create directory {}", parent.display()))?;
     }
 
     // Already up to date?
-    if dest.exists() && file_hash(&dest).unwrap_or_default() == entry.hash { return Ok(()); }
+    if dest.exists() && file_hash(&dest).unwrap_or_default() == entry.hash {
+        return Ok(());
+    }
 
-    // Binary patch available and permitted by the active strategy?
-    if allow_patch {
-        if let (Some(patch_info), true) = (&entry.patch, dest.exists()) {
-            let patch_url = format!("{}products/{}/{}/{}", base_url, product_name, version, patch_info.file);
-            let safe_temp_name = rel_path.replace("/", "_").replace("\\", "_");
-            let patch_dest = PathBuf::from("temp").join(format!("{}.patch", safe_temp_name));
+    const MAX_RETRIES: usize = 3;
+    let mut attempts = 0;
 
-            let _ = download_to(client, &patch_url, &patch_dest, 0).await?;
-            let (ret, _) = apply_patch(dest.clone(), patch_dest.clone(), dest.clone()).await?;
-            let _ = fs::remove_file(&patch_dest);
+    loop {
+        attempts += 1;
+        let mut patch_successful = false;
 
-            if ret == 0 && file_hash(&dest).unwrap_or_default() == entry.hash {
-                return Ok(());
-            } else {
-                eprintln!("Patch failed or hash mismatch for {}. Falling back to full download...", rel_path);
+        // Try patching (We only try this on the first attempt to save time)
+        if allow_patch && attempts == 1 {
+            if let (Some(patch_info), true) = (&entry.patch, dest.exists()) {
+                let patch_url = format!("{}products/{}/{}/{}", base_url, product_name, version, patch_info.file);
+                let safe_temp_name = rel_path.replace("/", "_").replace("\\", "_");
+                let patch_dest = temp_dir.join(format!("{}.patch", safe_temp_name));
+
+                // If download succeeds, try to apply it
+                if download_to(client, &patch_url, &patch_dest, 0).await.is_ok() {
+                    if let Ok((ret, _)) = apply_patch(dest.clone(), patch_dest.clone(), dest.clone()).await {
+                        if ret == 0 && file_hash(&dest).unwrap_or_default() == entry.hash {
+                            patch_successful = true;
+                        }
+                    }
+                }
+                let _ = fs::remove_file(&patch_dest); // Always clean up the patch file
+
+                if !patch_successful {
+                    eprintln!("Patch failed or hash mismatch for {}. Falling back to full download...", rel_path);
+                }
+            }
+        }
+
+        if patch_successful {
+            return Ok(());
+        }
+
+        // Full download fallback
+        let full_url = format!("{}products/{}/{}/full/{}", base_url, product_name, version, rel_path);
+        let safe_temp_name = rel_path.replace("/", "_").replace("\\", "_");
+        let download_temp_dest = temp_dir.join(format!("{}.download", safe_temp_name));
+
+        let download_result = async {
+            download_to(client, &full_url, &download_temp_dest, entry.size).await?;
+
+            let downloaded_hash = file_hash(&download_temp_dest).unwrap_or_default();
+            if downloaded_hash != entry.hash {
+                let _ = fs::remove_file(&download_temp_dest); // Clean up bad file
+                return Err(anyhow::anyhow!("Hash mismatch after downloading full file: {}", rel_path));
+            }
+
+            // Move it to final destination
+            fs::rename(&download_temp_dest, &dest).with_context(|| format!("Failed to move downloaded file to {}", dest.display()))?;
+
+            Ok::<(), anyhow::Error>(())
+        }.await;
+
+        // Evaluate the result
+        match download_result {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                if attempts >= MAX_RETRIES {
+                    return Err(e.context(format!("Failed to update {} after {} attempts", rel_path, MAX_RETRIES)));
+                }
+                eprintln!("Error updating {}: {}. Retrying {}/{}...", rel_path, e, attempts, MAX_RETRIES);
+
+                // Wait 1 second before retrying to give the network a chance to stabilize
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
     }
-
-    // Full download fallback
-    let full_url = format!("{}products/{}/{}/full/{}", base_url, product_name, version, rel_path);
-    download_to(client, &full_url, &dest, entry.size).await?;
-    Ok(())
 }
